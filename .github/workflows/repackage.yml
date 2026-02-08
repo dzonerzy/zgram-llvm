@@ -14,6 +14,7 @@ jobs:
                     - x86_64-linux
                     - aarch64-linux
                     - x86_64-windows
+                    - aarch64-windows
                     - aarch64-macos
         steps:
             - uses: actions/checkout@v4
@@ -54,8 +55,7 @@ jobs:
                     --notes "Minimal LLVM static libs and C API headers for zgram JIT compilation.
 
                   Contains only the libs needed for ORC JIT + X86 backend + optimizations.
-                  Linux tarballs include LTO-converted native ELF libs + Bootlin musl libstdc++.a.
-                  Windows tarball uses MinGW libs from dzonerzy/llvm-windows-zig (built with zig cc)." \
+                  All platforms built with zig cc from dzonerzy/llvm-zig. No zlib/zstd/libstdc++ deps." \
                     dist/*
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
