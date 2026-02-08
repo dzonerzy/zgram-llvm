@@ -14,7 +14,6 @@ jobs:
                     - x86_64-linux
                     - aarch64-linux
                     - x86_64-windows
-                    - aarch64-windows
                     - aarch64-macos
         steps:
             - uses: actions/checkout@v4
@@ -22,6 +21,12 @@ jobs:
             - uses: actions/setup-python@v5
               with:
                   python-version: "3.12"
+
+            - name: Install LLVM tools (for LTO conversion)
+              if: contains(matrix.platform, 'linux')
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y llvm clang
 
             - name: Repackage ${{ matrix.platform }}
               run: python3 repackage.py ${{ matrix.platform }}
@@ -46,15 +51,17 @@ jobs:
                   path: dist
                   merge-multiple: true
 
-            - name: Create release
+            - name: Upload to release
               run: |
+                  # Delete existing release if it exists, then recreate
+                  gh release delete "${{ github.ref_name }}" --yes 2>/dev/null || true
                   gh release create "${{ github.ref_name }}" \
                     --title "LLVM ${GITHUB_REF_NAME#v} minimal libs" \
                     --notes "Minimal LLVM static libs and C API headers for zgram JIT compilation.
 
                   Contains only the libs needed for ORC JIT + X86 backend + optimizations.
-
-                  Repackaged from official LLVM releases." \
+                  Linux tarballs include LTO-converted native ELF libs + Bootlin musl libstdc++.a.
+                  Windows tarball uses MinGW libs from dzonerzy/llvm-windows-zig (built with zig cc)." \
                     dist/*
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

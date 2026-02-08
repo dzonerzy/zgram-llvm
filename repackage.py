@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Repackage official LLVM release tarballs into minimal archives
-containing only the static libs and C API headers needed for zgram's JIT pipeline.
+Repackage LLVM static libraries into minimal archives for zgram's JIT pipeline.
+
+Linux/macOS: Downloads official LLVM release, extracts needed libs, converts
+LTO bitcode to native ELF (Linux), and bundles portable libstdc++.a from
+Bootlin musl toolchains.
+
+Windows: Downloads pre-built MinGW LLVM libs from dzonerzy/llvm-windows-zig
+(built with zig cc, uses libc++ ABI compatible with Zig's linkLibCpp).
 
 Usage:
     python3 repackage.py                  # repackage all platforms
@@ -15,6 +21,7 @@ Output tarballs use standardized naming:
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -22,27 +29,52 @@ import urllib.request
 
 LLVM_VERSION = "21.1.8"
 
-# Map from our standardized name -> official release asset name
-PLATFORMS = {
-    "x86_64-linux": f"LLVM-{LLVM_VERSION}-Linux-X64.tar.xz",
-    "aarch64-linux": f"LLVM-{LLVM_VERSION}-Linux-ARM64.tar.xz",
-    "x86_64-windows": f"clang+llvm-{LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz",
-    "aarch64-windows": f"clang+llvm-{LLVM_VERSION}-aarch64-pc-windows-msvc.tar.xz",
-    "aarch64-macos": f"LLVM-{LLVM_VERSION}-macOS-ARM64.tar.xz",
-}
-
-# The extracted top-level directory name differs per tarball
-EXTRACT_DIRS = {
-    "x86_64-linux": f"LLVM-{LLVM_VERSION}-Linux-X64",
-    "aarch64-linux": f"LLVM-{LLVM_VERSION}-Linux-ARM64",
-    "x86_64-windows": f"clang+llvm-{LLVM_VERSION}-x86_64-pc-windows-msvc",
-    "aarch64-windows": f"clang+llvm-{LLVM_VERSION}-aarch64-pc-windows-msvc",
-    "aarch64-macos": f"LLVM-{LLVM_VERSION}-macOS-ARM64",
-}
-
-RELEASE_URL = (
+# Map from our standardized name -> (release URL base, asset name, extract dir)
+# Linux/macOS use official LLVM releases
+# Windows uses our custom MinGW build from llvm-windows-zig (built with zig cc)
+OFFICIAL_URL = (
     f"https://github.com/llvm/llvm-project/releases/download/llvmorg-{LLVM_VERSION}"
 )
+MINGW_URL = f"https://github.com/dzonerzy/llvm-windows-zig/releases/download/llvm-{LLVM_VERSION}"
+
+PLATFORMS = {
+    "x86_64-linux": {
+        "url": f"{OFFICIAL_URL}/LLVM-{LLVM_VERSION}-Linux-X64.tar.xz",
+        "asset": f"LLVM-{LLVM_VERSION}-Linux-X64.tar.xz",
+        "extract_dir": f"LLVM-{LLVM_VERSION}-Linux-X64",
+    },
+    "aarch64-linux": {
+        "url": f"{OFFICIAL_URL}/LLVM-{LLVM_VERSION}-Linux-ARM64.tar.xz",
+        "asset": f"LLVM-{LLVM_VERSION}-Linux-ARM64.tar.xz",
+        "extract_dir": f"LLVM-{LLVM_VERSION}-Linux-ARM64",
+    },
+    "x86_64-windows": {
+        "url": f"{MINGW_URL}/llvm-{LLVM_VERSION}-mingw-x86_64-windows.tar.xz",
+        "asset": f"llvm-{LLVM_VERSION}-mingw-x86_64-windows.tar.xz",
+        "extract_dir": f"llvm-{LLVM_VERSION}-mingw-x86_64-windows",
+    },
+    "aarch64-macos": {
+        "url": f"{OFFICIAL_URL}/LLVM-{LLVM_VERSION}-macOS-ARM64.tar.xz",
+        "asset": f"LLVM-{LLVM_VERSION}-macOS-ARM64.tar.xz",
+        "extract_dir": f"LLVM-{LLVM_VERSION}-macOS-ARM64",
+    },
+}
+
+# Bootlin musl toolchains for portable libstdc++.a (Linux only)
+BOOTLIN_TOOLCHAINS = {
+    "x86_64-linux": {
+        "url": "https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64/tarballs/x86-64--musl--stable-2025.08-1.tar.xz",
+        "asset": "x86-64--musl--stable-2025.08-1.tar.xz",
+        "libstdcxx": "x86_64-buildroot-linux-musl/sysroot/usr/lib/libstdc++.a",
+        "libgcc_eh": "lib/gcc/x86_64-buildroot-linux-musl/14.3.0/libgcc_eh.a",
+    },
+    "aarch64-linux": {
+        "url": "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2025.08-1.tar.xz",
+        "asset": "aarch64--musl--stable-2025.08-1.tar.xz",
+        "libstdcxx": "aarch64-buildroot-linux-musl/sysroot/usr/lib/libstdc++.a",
+        "libgcc_eh": "lib/gcc/aarch64-buildroot-linux-musl/14.3.0/libgcc_eh.a",
+    },
+}
 
 # Required LLVM static libs (without prefix/extension)
 REQUIRED_LIBS = [
@@ -116,107 +148,202 @@ REQUIRED_LIBS = [
     "LLVMHipStdPar",
     "LLVMWindowsDriver",
     "LLVMOption",
+    # New in LLVM 21 (split from LLVMCodeGen and LLVMDebugInfoDWARF)
+    "LLVMCGData",
+    "LLVMDebugInfoDWARFLowLevel",
 ]
 
 
-def download_tarball(platform, dest_dir):
-    """Download official LLVM tarball for a platform."""
-    asset = PLATFORMS[platform]
-    url = f"{RELEASE_URL}/{asset}"
-    dest = os.path.join(dest_dir, asset)
+def report_progress(block_num, block_size, total_size):
+    downloaded = block_num * block_size
+    if total_size > 0:
+        pct = min(100, downloaded * 100 // total_size)
+        mb_down = downloaded / 1024 / 1024
+        mb_total = total_size / 1024 / 1024
+        print(f"\r  {mb_down:.0f}/{mb_total:.0f} MB ({pct}%)", end="", flush=True)
 
+
+def download(url, asset, dest_dir):
+    """Download a file if not already present."""
+    dest = os.path.join(dest_dir, asset)
     if os.path.exists(dest):
         print(f"  Already downloaded: {asset}")
         return dest
-
     print(f"  Downloading {asset}...")
-
-    def report_progress(block_num, block_size, total_size):
-        downloaded = block_num * block_size
-        if total_size > 0:
-            pct = min(100, downloaded * 100 // total_size)
-            mb_down = downloaded / 1024 / 1024
-            mb_total = total_size / 1024 / 1024
-            print(f"\r  {mb_down:.0f}/{mb_total:.0f} MB ({pct}%)", end="", flush=True)
-
     urllib.request.urlretrieve(url, dest, reporthook=report_progress)
-    print()  # newline after progress
+    print()
     return dest
 
 
-def repackage(platform, work_dir, output_dir):
-    """Download, selectively extract needed files, and create minimal tarball."""
-    is_windows = "windows" in platform
-    lib_ext = ".lib" if is_windows else ".a"
-    lib_prefix = "" if is_windows else "lib"
+def convert_lto_lib(lib_path, clang="clang", target=None):
+    """Convert a .a file containing LTO bitcode objects to native ELF objects.
 
-    extract_dir = EXTRACT_DIRS[platform]
+    Official LLVM 21 Linux releases use -DLLVM_ENABLE_LTO=Thin, so the .a files
+    contain LLVM IR bitcode instead of native machine code. This converts them.
+    """
+
+    work = lib_path + ".convert"
+    os.makedirs(work, exist_ok=True)
+
+    # Extract all .o files
+    subprocess.run(
+        ["llvm-ar", "x", os.path.abspath(lib_path)],
+        cwd=work,
+        check=True,
+        capture_output=True,
+    )
+
+    obj_files = []
+    for root, _, files in os.walk(work):
+        for f in files:
+            if f.endswith(".o") or f.endswith(".obj"):
+                obj_files.append(os.path.join(root, f))
+
+    if not obj_files:
+        shutil.rmtree(work)
+        return
+
+    # Check if first .o is bitcode
+    result = subprocess.run(["file", obj_files[0]], capture_output=True, text=True)
+    if "LLVM IR bitcode" not in result.stdout:
+        shutil.rmtree(work)
+        return  # Already native, nothing to do
+
+    # Convert each .o from bitcode to native
+    native_objs = []
+    for obj in obj_files:
+        native = obj + ".native"
+        cmd = [clang, "-x", "ir", "-c", "-O2", "-o", native, obj]
+        if target:
+            cmd.extend(["--target=" + target])
+        subprocess.run(cmd, check=True, capture_output=True)
+        native_objs.append(native)
+
+    # Repack into .a
+    os.remove(lib_path)
+    subprocess.run(
+        ["llvm-ar", "rcs", os.path.abspath(lib_path)] + native_objs,
+        check=True,
+        capture_output=True,
+    )
+    shutil.rmtree(work)
+
+
+def repackage(platform, work_dir, output_dir):
+    """Download, extract, convert, and create minimal tarball."""
+    is_windows = "windows" in platform
+    is_linux = "linux" in platform
+    # All platforms now use lib*.a (MinGW for Windows, ELF for Linux/macOS)
+    lib_prefix = "lib"
+    lib_ext = ".a"
+
+    pinfo = PLATFORMS[platform]
+    extract_dir = pinfo["extract_dir"]
     stage_name = f"llvm-{LLVM_VERSION}-{platform}"
+    stage_dir = os.path.join(work_dir, stage_name)
     output_name = f"{stage_name}.tar.xz"
     output_path = os.path.join(output_dir, output_name)
 
     print(f"\n=== Repackaging {platform} ===")
 
-    # Download
-    tarball = download_tarball(platform, work_dir)
+    # Download LLVM tarball
+    tarball = download(pinfo["url"], pinfo["asset"], work_dir)
 
     # Build set of paths we want to extract
-    wanted = set()
+    wanted_libs = set()
     for lib in REQUIRED_LIBS:
-        wanted.add(f"{extract_dir}/lib/{lib_prefix}{lib}{lib_ext}")
+        wanted_libs.add(f"{extract_dir}/lib/{lib_prefix}{lib}{lib_ext}")
 
-    # C++ runtime static libs (Linux/macOS only)
-    RT_SUBDIRS = {
-        "x86_64-linux": "x86_64-unknown-linux-gnu",
-        "aarch64-linux": "aarch64-unknown-linux-gnu",
-        "aarch64-macos": "aarch64-apple-darwin",
-    }
-    rt_subdir = RT_SUBDIRS.get(platform)
-    if rt_subdir:
-        for lib in ["libc++.a", "libc++abi.a", "libunwind.a"]:
-            wanted.add(f"{extract_dir}/lib/{rt_subdir}/{lib}")
+    # Header prefixes to extract
+    header_prefixes = [
+        f"{extract_dir}/include/llvm-c/",
+        f"{extract_dir}/include/llvm/Config/",
+    ]
 
-    # llvm-c headers prefix (match anything under include/llvm-c/)
-    headers_prefix = f"{extract_dir}/include/llvm-c/"
+    # Extract needed files to staging directory
+    print(f"  Extracting {len(wanted_libs)} libs + headers from tarball...")
+    os.makedirs(stage_dir, exist_ok=True)
+    os.makedirs(os.path.join(stage_dir, "lib"), exist_ok=True)
 
-    # Stream through the tarball, extracting only what we need
-    print(f"  Extracting {len(wanted)} libs + headers from tarball...")
     extracted_count = 0
-    total_size = 0
-
     with tarfile.open(tarball, "r:xz") as src:
-        with tarfile.open(output_path, "w:xz") as dst:
-            for member in src:
-                # Check if this member is one we want
-                if member.name in wanted or member.name.startswith(headers_prefix):
-                    # Rewrite the path: replace extract_dir prefix with stage_name
-                    member.name = stage_name + member.name[len(extract_dir) :]
-                    if member.isfile():
-                        fileobj = src.extractfile(member)
-                        dst.addfile(member, fileobj)
-                        total_size += member.size
-                        extracted_count += 1
-                    elif member.isdir():
-                        dst.addfile(member)
+        for member in src:
+            is_wanted_lib = member.name in wanted_libs
+            is_wanted_header = any(member.name.startswith(p) for p in header_prefixes)
+            if (is_wanted_lib or is_wanted_header) and member.isfile():
+                # Rewrite path: replace extract_dir with stage_dir
+                rel_path = member.name[len(extract_dir) + 1 :]
+                dest_path = os.path.join(stage_dir, rel_path)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, "wb") as out:
+                    out.write(src.extractfile(member).read())
+                extracted_count += 1
 
-    # Verify by re-reading the output tarball
+    print(f"  Extracted {extracted_count} files")
+
+    # Linux: convert LTO bitcode .a files to native ELF
+    if is_linux:
+        print("  Converting LTO bitcode libs to native ELF...")
+        clang_target = {
+            "x86_64-linux": "x86_64-linux-gnu",
+            "aarch64-linux": "aarch64-linux-gnu",
+        }.get(platform)
+        lib_dir = os.path.join(stage_dir, "lib")
+        converted = 0
+        for lib in REQUIRED_LIBS:
+            lib_path = os.path.join(lib_dir, f"lib{lib}.a")
+            if os.path.exists(lib_path):
+                convert_lto_lib(lib_path, target=clang_target)
+                converted += 1
+        print(f"  Converted {converted} libs")
+
+    # Linux: add portable libstdc++.a + libgcc_eh.a from Bootlin musl toolchain
+    if platform in BOOTLIN_TOOLCHAINS:
+        bt = BOOTLIN_TOOLCHAINS[platform]
+        print(f"  Downloading Bootlin musl toolchain...")
+        bt_tarball = download(bt["url"], bt["asset"], work_dir)
+
+        print(f"  Extracting libstdc++.a and libgcc_eh.a...")
+        bt_extract_dir = bt["asset"].replace(".tar.xz", "")
+        with tarfile.open(bt_tarball, "r:xz") as tf:
+            for member in tf:
+                rel = member.name
+                # Strip the top-level dir from tarball
+                if "/" in rel:
+                    after_top = "/".join(rel.split("/")[1:])
+                else:
+                    continue
+                if after_top == bt["libstdcxx"] or after_top == bt["libgcc_eh"]:
+                    dest_name = os.path.basename(after_top)
+                    dest_path = os.path.join(stage_dir, "lib", dest_name)
+                    with open(dest_path, "wb") as out:
+                        out.write(tf.extractfile(member).read())
+                    print(f"    Extracted {dest_name}")
+
+    # Verify all required libs are present
     missing = []
-    with tarfile.open(output_path, "r:xz") as tf:
-        members = set(m.name for m in tf.getmembers())
     for lib in REQUIRED_LIBS:
-        if f"{stage_name}/lib/{lib_prefix}{lib}{lib_ext}" not in members:
+        if not os.path.exists(
+            os.path.join(stage_dir, "lib", f"{lib_prefix}{lib}{lib_ext}")
+        ):
             missing.append(lib)
-
     if missing:
         print(f"  WARNING: Missing libs: {missing}")
 
-    output_size = os.path.getsize(output_path) / 1024 / 1024
-    total_size_mb = total_size / 1024 / 1024
-    lib_count = len(REQUIRED_LIBS) - len(missing)
-
-    print(
-        f"  Done: {lib_count} libs, {total_size_mb:.1f} MB uncompressed, {output_size:.1f} MB compressed"
+    # Create output tarball (use system tar with parallel xz for speed)
+    print(f"  Creating {output_name}...")
+    subprocess.run(
+        ["tar", "cJf", output_path, "-C", work_dir, stage_name],
+        check=True,
+        env={**os.environ, "XZ_OPT": "-T0 -6"},
     )
+
+    # Cleanup staging dir
+    shutil.rmtree(stage_dir)
+
+    output_size = os.path.getsize(output_path) / 1024 / 1024
+    lib_count = len(REQUIRED_LIBS) - len(missing)
+    print(f"  Done: {lib_count} libs, {output_size:.1f} MB compressed")
     print(f"  Output: {output_path}")
 
     return output_path
@@ -243,8 +370,8 @@ def main():
 
     if args.list:
         print("Available platforms:")
-        for name, asset in PLATFORMS.items():
-            print(f"  {name:20s} <- {asset}")
+        for name, pinfo in PLATFORMS.items():
+            print(f"  {name:20s} <- {pinfo['asset']}")
         return
 
     platforms = args.platforms or list(PLATFORMS.keys())
