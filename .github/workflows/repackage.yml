@@ -1,0 +1,60 @@
+name: Repackage LLVM libs
+
+on:
+    push:
+        tags:
+            - "v*"
+
+jobs:
+    repackage:
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                platform:
+                    - x86_64-linux
+                    - aarch64-linux
+                    - x86_64-windows
+                    - aarch64-windows
+                    - aarch64-macos
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Repackage ${{ matrix.platform }}
+              run: python3 repackage.py ${{ matrix.platform }}
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: llvm-${{ matrix.platform }}
+                  path: dist/*.tar.xz
+
+    release:
+        needs: repackage
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: dist
+                  merge-multiple: true
+
+            - name: Create release
+              run: |
+                  gh release create "${{ github.ref_name }}" \
+                    --title "LLVM ${GITHUB_REF_NAME#v} minimal libs" \
+                    --notes "Minimal LLVM static libs and C API headers for zgram JIT compilation.
+
+                  Contains only the libs needed for ORC JIT + X86 backend + optimizations.
+
+                  Repackaged from official LLVM releases." \
+                    dist/*
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
