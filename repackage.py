@@ -131,6 +131,10 @@ REQUIRED_LIBS = [
     # New in LLVM 21 (split from LLVMCodeGen and LLVMDebugInfoDWARF)
     "LLVMCGData",
     "LLVMDebugInfoDWARFLowLevel",
+    # New in LLVM 21 (required by Vectorize/Passes for O3 optimization pipeline)
+    "LLVMSandboxIR",
+    "LLVMFrontendAtomic",
+    "LLVMObjectYAML",
 ]
 
 
