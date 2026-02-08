@@ -175,7 +175,42 @@ def download(url, asset, dest_dir):
     return dest
 
 
-def convert_lto_lib(lib_path, clang="clang", target=None):
+def _get_llvm_tools(work_dir):
+    """Download and extract clang + llvm-ar from the x86_64-linux LLVM release.
+
+    These are needed to convert LTO bitcode to native code. We always use the
+    x86_64-linux tools since that's what CI runners (and most dev machines) run.
+    Returns the path to the directory containing the tool binaries.
+    """
+    tools_dir = os.path.join(work_dir, "llvm-tools")
+    if os.path.exists(os.path.join(tools_dir, "clang")):
+        return tools_dir  # Already extracted
+
+    x86_info = PLATFORMS["x86_64-linux"]
+    tarball = download(x86_info["url"], x86_info["asset"], work_dir)
+    x86_extract_dir = x86_info["extract_dir"]
+
+    # clang is a symlink to clang-{major}, so extract the real binary
+    llvm_major = LLVM_VERSION.split(".")[0]
+    wanted_bins = {
+        f"{x86_extract_dir}/bin/clang-{llvm_major}": "clang",
+        f"{x86_extract_dir}/bin/llvm-ar": "llvm-ar",
+    }
+
+    os.makedirs(tools_dir, exist_ok=True)
+    print(f"  Extracting LLVM {LLVM_VERSION} tools (clang-{llvm_major}, llvm-ar)...")
+    with tarfile.open(tarball, "r:xz") as tf:
+        for member in tf:
+            if member.name in wanted_bins and member.isfile():
+                dest = os.path.join(tools_dir, wanted_bins[member.name])
+                with open(dest, "wb") as out:
+                    out.write(tf.extractfile(member).read())
+                os.chmod(dest, 0o755)
+
+    return tools_dir
+
+
+def convert_lto_lib(lib_path, clang="clang", llvm_ar="llvm-ar", target=None):
     """Convert a .a file containing LTO bitcode objects to native ELF objects.
 
     Official LLVM 21 Linux releases use -DLLVM_ENABLE_LTO=Thin, so the .a files
@@ -187,7 +222,7 @@ def convert_lto_lib(lib_path, clang="clang", target=None):
 
     # Extract all .o files
     subprocess.run(
-        ["llvm-ar", "x", os.path.abspath(lib_path)],
+        [llvm_ar, "x", os.path.abspath(lib_path)],
         cwd=work,
         check=True,
         capture_output=True,
@@ -203,26 +238,49 @@ def convert_lto_lib(lib_path, clang="clang", target=None):
         shutil.rmtree(work)
         return
 
-    # Check if first .o is bitcode
-    result = subprocess.run(["file", obj_files[0]], capture_output=True, text=True)
-    if "LLVM IR bitcode" not in result.stdout:
-        shutil.rmtree(work)
-        return  # Already native, nothing to do
-
-    # Convert each .o from bitcode to native
+    # Convert each .o from bitcode to native, skip already-native objects.
+    # LLVM bitcode files start with magic bytes 'BC' (0x42 0x43).
     native_objs = []
+    bitcode_objs = []
     for obj in obj_files:
+        with open(obj, "rb") as f:
+            magic = f.read(2)
+        if magic == b"BC":
+            bitcode_objs.append(obj)
+        else:
+            native_objs.append(obj)  # Already native (e.g. hand-written asm)
+
+    if not bitcode_objs:
+        shutil.rmtree(work)
+        return  # All objects were already native
+
+    # Compile bitcode objects in parallel using threads (subprocess-bound work)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _convert_one(obj):
         native = obj + ".native"
         cmd = [clang, "-x", "ir", "-c", "-O2", "-o", native, obj]
         if target:
             cmd.extend(["--target=" + target])
-        subprocess.run(cmd, check=True, capture_output=True)
-        native_objs.append(native)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return (False, os.path.basename(obj), result.stderr.strip())
+        return (True, native, "")
+
+    nproc = os.cpu_count() or 4
+    with ThreadPoolExecutor(max_workers=nproc) as executor:
+        results = list(executor.map(_convert_one, bitcode_objs))
+
+    for ok, info, err in results:
+        if not ok:
+            print(f"    ERROR converting {info}: {err}")
+            raise RuntimeError(f"Failed to convert {info}")
+        native_objs.append(info)
 
     # Repack into .a
     os.remove(lib_path)
     subprocess.run(
-        ["llvm-ar", "rcs", os.path.abspath(lib_path)] + native_objs,
+        [llvm_ar, "rcs", os.path.abspath(lib_path)] + native_objs,
         check=True,
         capture_output=True,
     )
@@ -283,7 +341,14 @@ def repackage(platform, work_dir, output_dir):
 
     # Linux: convert LTO bitcode .a files to native ELF
     if is_linux:
-        print("  Converting LTO bitcode libs to native ELF...")
+        # Need clang 21 + llvm-ar 21 to read LLVM 21 LTO bitcode.
+        # Always use x86_64-linux tools (CI runners are x86_64).
+        tools_dir = _get_llvm_tools(work_dir)
+        bundled_clang = os.path.join(tools_dir, "clang")
+        bundled_ar = os.path.join(tools_dir, "llvm-ar")
+        print(
+            f"  Converting LTO bitcode libs to native ELF (using LLVM {LLVM_VERSION} clang)..."
+        )
         clang_target = {
             "x86_64-linux": "x86_64-linux-gnu",
             "aarch64-linux": "aarch64-linux-gnu",
@@ -293,7 +358,12 @@ def repackage(platform, work_dir, output_dir):
         for lib in REQUIRED_LIBS:
             lib_path = os.path.join(lib_dir, f"lib{lib}.a")
             if os.path.exists(lib_path):
-                convert_lto_lib(lib_path, target=clang_target)
+                convert_lto_lib(
+                    lib_path,
+                    clang=bundled_clang,
+                    llvm_ar=bundled_ar,
+                    target=clang_target,
+                )
                 converted += 1
         print(f"  Converted {converted} libs")
 
